@@ -1,24 +1,85 @@
 """Prompt templates for the agent nodes.
 
-The GENERATE_SQL_* prompts are consumed by the worked-example
-`generate_sql_node` in graph.py via `.format(schema=..., question=...)`, so
-keep those placeholders intact. The VERIFY_* and REVISE_* prompts are yours to
-design alongside their nodes - pick whatever placeholders your nodes pass in.
+Layout is tuned for vLLM automatic prefix caching (single H100, ~10 RPS), so
+the tokens are ordered most-static-first to changeable-last:
 
-Filling these in is part of Phase 3.
+    [SYSTEM]  global rules (identical for every request)  ── shared by ALL calls
+              + schema (identical for a given db_id)       ── shared by same-db calls
+    [USER]    Question: <question>                         ── shared by the 3 steps
+              ### STEP: <GENERATE|VERIFY|REVISE> + payload  ── unique tail
+
+Concretely:
+- Across different requests the long static SYSTEM prefix (rules + schema) is a
+  cache hit, so the expensive schema tokens are only prefilled once per db_id.
+- Within a single query, generate/verify/revise share
+  `SYSTEM + "Question: <q>\n\n### STEP: "`, so each follow-up call re-prefills
+  only its own short step section.
+- The only changeable parts (step name, prior SQL, result, issue) live at the
+  very end, after the shared prefix, exactly where the cache wants them.
+
+`SYSTEM` is `.format(schema=...)`-ed; the `*_USER` templates are
+`.format(...)`-ed with the per-step fields. Keep `{question}` first in every
+user template so the per-query prefix stays identical across steps.
 """
 
-GENERATE_SQL_SYSTEM = ""
+SYSTEM = """You are a precise text-to-SQL agent for SQLite databases.
 
-# Available placeholders: {schema}, {question}
-GENERATE_SQL_USER = ""
+Rules:
+- Dialect is SQLite. Use only the tables and columns in the schema below, and double-quote identifiers that contain spaces or are reserved words.
+- Read-only: emit a single SELECT (or WITH ... SELECT) statement.
+- Every request ends with a STEP section. Produce exactly the OUTPUT it asks for and nothing else: no markdown fences, no comments, no prose.
+
+Schema:
+{schema}"""
 
 
-VERIFY_SYSTEM = ""
+# All three steps deliberately share one system prompt so that the
+# `SYSTEM + schema` prefix is byte-identical across generate/verify/revise (and
+# across every request for the same db_id), which is what lets vLLM's prefix
+# cache reuse the expensive schema prefill. They're kept as separate names so
+# each node references its own, but they intentionally point at the same value.
+GENERATE_SQL_SYSTEM = SYSTEM
+VERIFY_SYSTEM = SYSTEM
+REVISE_SYSTEM = SYSTEM
 
-VERIFY_USER = ""
+
+# Available placeholders: {question}
+GENERATE_USER = """Question: {question}
+
+### STEP: GENERATE
+Write one SQLite query that answers the question.
+OUTPUT: the SQL query as plain text only."""
 
 
-REVISE_SYSTEM = ""
+# Available placeholders: {question}, {sql}, {result}
+VERIFY_USER = """Question: {question}
 
-REVISE_USER = ""
+### STEP: VERIFY
+Judge whether the executed query's result plausibly answers the question.
+
+Query:
+{sql}
+
+Result:
+{result}
+
+Set ok=false when the query errored, returned zero rows although the question implies some should exist, or the columns/values clearly fail to answer the question. Otherwise set ok=true.
+OUTPUT: one line of JSON: {{"ok": true|false, "issue": "<short reason, empty if ok>"}}"""
+
+
+# Available placeholders: {question}, {sql}, {result}, {issue}
+REVISE_USER = """Question: {question}
+
+### STEP: REVISE
+The previous query was rejected. Return a corrected query.
+
+Previous query:
+{sql}
+
+Result:
+{result}
+
+Issue:
+{issue}
+
+OUTPUT: the corrected SQLite query as plain text only."""

@@ -54,13 +54,19 @@ class AgentState:
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
-def llm() -> ChatOpenAI:
-    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default)."""
+def llm(max_tokens: int | None = None) -> ChatOpenAI:
+    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default).
+
+    `max_tokens` caps the completion length so a single H100 isn't tied up
+    generating runaway output: SQL and the verify JSON are both short, so
+    capping them keeps decode time (and KV-cache residency) low at ~10 RPS.
+    """
     return ChatOpenAI(
         model=VLLM_MODEL,
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        max_tokens=max_tokens,
     )
 
 
@@ -71,14 +77,44 @@ def _attach_schema(state: AgentState) -> dict:
     return {"schema": render_schema(state.db_id)}
 
 
+_SQL_START = re.compile(r"\b(WITH|SELECT)\b", re.IGNORECASE)
+
+
 def _extract_sql(text: str) -> str:
     """Pull a SQL statement out of an LLM reply, stripping markdown fences/prose.
 
-    Intentionally simple: take the first ```sql ... ``` block if there is one,
-    otherwise the whole reply. You may need to harden this for your prompts.
+    Prompts ask for pure SQL, but real models (gpt-4o-mini and Qwen alike)
+    occasionally wrap it in a fence or prepend a stray word, so we harden the
+    parse rather than trust the instruction blindly:
+
+    1. Prefer the first ```sql ... ``` block if one is present.
+    2. Drop any leading prose before the first SELECT/WITH keyword.
+    3. Strip a trailing semicolon so we hand a single clean statement to sqlite.
     """
+    if not text:
+        return ""
     fenced = re.search(r"```(?:sql)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    return (fenced.group(1) if fenced else text).strip()
+    candidate = (fenced.group(1) if fenced else text).strip()
+    start = _SQL_START.search(candidate)
+    if start:
+        candidate = candidate[start.start():].strip()
+    return candidate.rstrip().rstrip(";").strip()
+
+
+def _parse_verify(text: str) -> tuple[bool, str]:
+    """Defensively parse the verifier's {"ok": bool, "issue": str} reply.
+
+    The model may wrap the JSON in prose or fences, so we regex out the verdict
+    instead of a strict json.loads. If no verdict is found we accept (ok=True)
+    rather than spend another LLM call on an ambiguous reply.
+    """
+    verdict = re.search(r'"?ok"?\s*[:=]\s*(true|false)', text, re.IGNORECASE)
+    if verdict is None:
+        return True, ""
+    ok = verdict.group(1).lower() == "true"
+    issue_match = re.search(r'"?issue"?\s*[:=]\s*"([^"]*)"', text, re.IGNORECASE)
+    issue = issue_match.group(1).strip() if issue_match else ""
+    return ok, issue
 
 
 def generate_sql_node(state: AgentState) -> dict:
@@ -88,15 +124,14 @@ def generate_sql_node(state: AgentState) -> dict:
     and return only the state fields you changed. `iteration` is bumped here
     (and in revise) so route_after_verify can enforce MAX_ITERATIONS.
 
-    This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
-    in prompts.py to make it produce real queries.
+    The system message carries the static rules + schema (a prefix-cache hit
+    across every request for this db_id); the user message puts the question on
+    top with the STEP section last, so all three step prompts share the longest
+    possible prefix. See prompts.py for the full layout rationale.
     """
-    response = llm().invoke([
-        ("system", prompts.GENERATE_SQL_SYSTEM),
-        ("user", prompts.GENERATE_SQL_USER.format(
-            schema=state.schema,
-            question=state.question,
-        )),
+    response = llm(max_tokens=512).invoke([
+        ("system", prompts.GENERATE_SQL_SYSTEM.format(schema=state.schema)),
+        ("user", prompts.GENERATE_USER.format(question=state.question)),
     ])
     sql = _extract_sql(response.content)
     return {
@@ -124,7 +159,21 @@ def verify_node(state: AgentState) -> dict:
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    result = state.execution.render() if state.execution is not None else "(no result)"
+    response = llm(max_tokens=128).invoke([
+        ("system", prompts.VERIFY_SYSTEM.format(schema=state.schema)),
+        ("user", prompts.VERIFY_USER.format(
+            question=state.question,
+            sql=state.sql,
+            result=result,
+        )),
+    ])
+    ok, issue = _parse_verify(response.content)
+    return {
+        "verify_ok": ok,
+        "verify_issue": issue,
+        "history": state.history + [{"node": "verify", "ok": ok, "issue": issue}],
+    }
 
 
 def revise_node(state: AgentState) -> dict:
@@ -137,7 +186,22 @@ def revise_node(state: AgentState) -> dict:
 
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    result = state.execution.render() if state.execution is not None else "(no result)"
+    response = llm(max_tokens=512).invoke([
+        ("system", prompts.REVISE_SYSTEM.format(schema=state.schema)),
+        ("user", prompts.REVISE_USER.format(
+            question=state.question,
+            sql=state.sql,
+            result=result,
+            issue=state.verify_issue or "(no issue given)",
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [{"node": "revise", "sql": sql}],
+    }
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -146,7 +210,9 @@ def route_after_verify(state: AgentState) -> str:
     Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
     the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok or state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------
