@@ -9,6 +9,7 @@ agent's final SQL, the result rows, and per-iteration history.
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager, nullcontext
 from typing import Any
 
 from dotenv import load_dotenv
@@ -22,14 +23,54 @@ from agent.graph import AgentState, graph  # noqa: E402
 # Langfuse callback handler. If keys are set we initialize it; failures
 # are NOT swallowed - a misconfigured Langfuse should not silently
 # produce zero traces.
+#
+# langfuse 4.x: the CallbackHandler auto-instruments the LangGraph run (one
+# nested span per node: generate_sql / verify / (revise)), while trace-level
+# attributes - name, tags, metadata - are set with the module-level
+# propagate_attributes() context manager wrapped around graph.invoke(). The
+# README's `from langfuse.callback import CallbackHandler` snippet is the old
+# v2 API; the v4 import lives under langfuse.langchain.
 _lf_handler: Any = None
+_lf_client: Any = None
+_propagate_attributes: Any = None
 if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
+    from langfuse import get_client, propagate_attributes
     from langfuse.langchain import CallbackHandler
 
     _lf_handler = CallbackHandler()
+    _lf_client = get_client()
+    _propagate_attributes = propagate_attributes
 
 
-app = FastAPI()
+def _trace_attributes(req: "AnswerRequest"):
+    """Name the trace and attach filterable tags/metadata for Phase 6.
+
+    Tags are emitted as `key:value` strings (plus `db:<db>`) so traces are
+    filterable in the Langfuse trace list; the same fields are duplicated into
+    metadata for richer inspection. No-op when Langfuse is not configured.
+    """
+    if _propagate_attributes is None:
+        return nullcontext()
+    tags = [f"{k}:{v}" for k, v in req.tags.items()]
+    tags.append(f"db:{req.db}")
+    return _propagate_attributes(
+        trace_name="agent_run",
+        tags=tags,
+        metadata={"db": req.db, **{k: str(v) for k, v in req.tags.items()}},
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Flush buffered events on shutdown so no trace is lost when the server
+    # stops (e.g. after a load-test / eval run). Per-request flushing is
+    # avoided on purpose - it would add network latency to the SLO path.
+    if _lf_client is not None:
+        _lf_client.flush()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class AnswerRequest(BaseModel):
@@ -60,7 +101,8 @@ def answer(req: AnswerRequest) -> AnswerResponse:
         "metadata": req.tags,
     }
     try:
-        final = graph.invoke(state, config=config)
+        with _trace_attributes(req):
+            final = graph.invoke(state, config=config)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
