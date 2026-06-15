@@ -26,6 +26,14 @@ DEFAULT_OUT_FILE = ROOT / "results" / "eval_baseline.json"
 DB_DIR = ROOT / "data" / "bird"
 AGENT_URL_DEFAULT = "http://localhost:8001/answer"
 
+# When DEBUG is on we (a) optionally restrict the run to a handful of evals and
+# (b) print a detailed dump for every failed eval. Turn off for a clean run.
+DEBUG = True
+
+# 1-indexed line numbers in the eval set to run (matches the file's line
+# numbers). Empty -> run the whole eval set as usual. Only honored when DEBUG.
+DEBUG_EVALS_TO_RUN_LINE_NUM: list[int] = []
+
 
 # ---------- Helpers (provided) -----------------------------------------
 
@@ -56,21 +64,142 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 
 # ---------- Implement these (Phase 5) ----------------------------------
 
+def _format_rows(rows: list[tuple] | None) -> str:
+    """Render canonicalized rows for the DEBUG dump."""
+    if rows is None:
+        return "(query failed / no rows)"
+    if not rows:
+        return "(empty result set)"
+    return "\n".join(" | ".join(cell for cell in row) for row in rows)
+
+
+def _print_failure(line: int, r: dict) -> None:
+    """Print a failed eval inline, right after its eval line in main()."""
+    print("---")
+    print(f"[line {line}] {r['question']}")
+    print()
+    print("Expected rows:")
+    print(_format_rows(r.get("expected_rows")))
+    print()
+    print("Actual rows:")
+    print(_format_rows(r.get("actual_rows")))
+    print()
+    print(f"Database: {r['db_id']}")
+    print()
+    print("Expected (gold) SQL:")
+    print(r["gold_sql"])
+    print()
+    print("Actual SQL:")
+    print(r["final_sql"] or "(none)")
+    print()
+
+
 def eval_one(question: dict, agent_url: str) -> dict:
-    """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+    """Score one question off the agent's *final* result only.
+
+    We deliberately ignore the per-iteration history: whatever SQL the agent
+    settled on (after however many revise loops) is what gets scored. A
+    question that needed 3 iterations counts as a success only at iteration 3 -
+    iterations 1 and 2 are treated as unsuccessful (see summarize()).
+
+    DEBUG behavior lives here so main() stays untouched: eval_one tracks its own
+    1-indexed call number (== eval-set line, since main iterates in file order).
+    When DEBUG_EVALS_TO_RUN_LINE_NUM is non-empty, lines outside it are skipped
+    (no agent call); failed evals are printed inline right after the eval line.
+    """
+    line = getattr(eval_one, "_line", 0) + 1
+    eval_one._line = line  # type: ignore[attr-defined]
+
+    db_id = question["db_id"]
+    q_text = question["question"]
+    gold_sql = question["gold_sql"]
+
+    if DEBUG and DEBUG_EVALS_TO_RUN_LINE_NUM and line not in DEBUG_EVALS_TO_RUN_LINE_NUM:
+        return {"line": line, "db_id": db_id, "question": q_text, "skipped": True}
+
+    gold_ok, gold_rows, gold_err = run_sql(db_id, gold_sql)
+
+    try:
+        resp = httpx.post(
+            agent_url,
+            json={"question": q_text, "db": db_id, "tags": {"suite": "eval"}},
+            timeout=120.0,
+        ).json()
+    except Exception as e:  # noqa: BLE001
+        resp = {"sql": "", "iterations": 0, "ok": False, "error": f"request failed: {type(e).__name__}: {e}"}
+
+    final_sql = resp.get("sql", "")
+    pred_ok, pred_rows, pred_err = run_sql(db_id, final_sql) if final_sql else (False, None, "no SQL returned")
+    final_correct = bool(gold_ok and pred_ok and matches(gold_rows, pred_rows))
+
+    result = {
+        "line": line,
+        "question": q_text,
+        "db_id": db_id,
+        "gold_sql": gold_sql,
+        "final_sql": final_sql,
+        "iterations": resp.get("iterations", 0),
+        "gold_ok": gold_ok,
+        "gold_error": gold_err,
+        "agent_ok": bool(resp.get("ok")),
+        "agent_error": resp.get("error"),
+        "pred_ok": pred_ok,
+        "pred_error": pred_err,
+        "final_correct": final_correct,
+        "expected_rows": canonicalize(gold_rows),
+        "actual_rows": canonicalize(pred_rows),
+    }
+
+    if DEBUG and not final_correct:
+        _print_failure(line, result)
+
+    return result
 
 
 def summarize(results: list[dict]) -> dict:
-    """Aggregate per-question results.
+    """Aggregate per-question results from the final-iteration verdict.
 
-    Per-iteration carry-forward: if the agent terminated at iteration j < k
-    (verify said ok at j, or it hit MAX_ITERATIONS at j < k), treat the
-    question's iteration-k result as identical to its iteration-j result.
-    The agent stopped emitting; whatever it had at termination is what
-    would have been served had we polled at iteration k.
+    Per-iteration pass rate is built from the iteration count alone: a question
+    that succeeded after `f` iterations contributes a success to iteration `f`
+    and every later iteration (carry-forward), and nothing to iterations
+    `< f`. So `iter_k` = "pass rate if the loop were allowed up to k iterations".
     """
-    raise NotImplementedError("Phase 5")
+    # DEBUG line selection may produce skipped stubs; they aren't scored.
+    results = [r for r in results if not r.get("skipped")]
+    n = len(results)
+    max_iters = max((r["iterations"] for r in results), default=0)
+
+    correct_at = {k: 0 for k in range(1, max_iters + 1)}
+    for r in results:
+        if r["final_correct"]:
+            f = max(r["iterations"], 1)
+            for k in range(f, max_iters + 1):
+                correct_at[k] += 1
+
+    overall_correct = sum(1 for r in results if r["final_correct"])
+
+    iters_hist: dict[int, int] = {}
+    for r in results:
+        k = r["iterations"]
+        iters_hist[k] = iters_hist.get(k, 0) + 1
+
+    def rate(c: int) -> float:
+        return round(c / n, 4) if n else 0.0
+
+    return {
+        "n": n,
+        "overall_correct": overall_correct,
+        "overall_pass_rate": rate(overall_correct),
+        "pass_rate_by_iteration": {
+            f"iter_{k}": rate(correct_at[k]) for k in range(1, max_iters + 1)
+        },
+        "correct_by_iteration": {
+            f"iter_{k}": correct_at[k] for k in range(1, max_iters + 1)
+        },
+        "iterations_histogram": {str(k): iters_hist[k] for k in sorted(iters_hist)},
+        "gold_exec_failures": sum(1 for r in results if not r["gold_ok"]),
+        "agent_exec_failures": sum(1 for r in results if not r["agent_ok"]),
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
