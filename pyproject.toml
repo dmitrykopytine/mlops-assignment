@@ -6,6 +6,9 @@ requires-python = ">=3.11"
 dependencies = [
     # Serving
     "vllm>=0.9.0,<0.11",
+    # vLLM 0.10.x is built against transformers 4.x; transformers 5.x removed
+    # tokenizer attrs (e.g. all_special_tokens_extended) that vLLM still uses.
+    "transformers>=4.55.2,<5.0",
     # Agent (major-version bounded; uv.lock pins exactly)
     "langgraph>=1.0,<2.0",
     "langchain>=1.0,<2.0",

@@ -29,6 +29,10 @@ def _bt(ident: str) -> str:
     return "`" + ident.replace("`", "``") + "`"
 
 
+# Set to False to disable data sampling and render only the bare CREATE TABLE
+# statements (the original schema format, no "Data samples for ..." hints).
+ENABLE_SAMPLING = False
+
 # Sampling knobs. Kept small on purpose: the samples live in the prefix-cached
 # part of the prompt, so they are prefilled once per db_id and reused.
 SAMPLE_ROWS = 10  # rows scanned per table (no ORDER BY -> cheap + deterministic)
@@ -117,9 +121,10 @@ def render_schema(db_id: str) -> str:
                 )
             parts.append(",\n".join(col_lines))
             parts.append(");")
-            samples = _data_samples(conn, t)
-            if samples:
-                parts.append(samples)
+            if ENABLE_SAMPLING:
+                samples = _data_samples(conn, t)
+                if samples:
+                    parts.append(samples)
     return "\n".join(parts)
 
 
