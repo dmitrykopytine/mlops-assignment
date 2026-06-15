@@ -20,13 +20,20 @@ MAX_PREVIEW_ROWS = 30
 
 # ---- Paste the failure dump between the triple quotes -----------------
 DUMP = """
-Database: codebase_community
+Database: financial
 
 Expected (gold) SQL:
-SELECT Date FROM badges WHERE Date = '2010-07-19 19:39:08.0'
+SELECT AVG(T1.A15) FROM district AS T1 INNER JOIN account AS T2 ON T1.district_id = T2.district_id WHERE STRFTIME('%Y', T2.date) >= '1997' AND T1.A15 > 4000
 
 Actual SQL:
-SELECT Date FROM badges WHERE Date = '2010-07-19 19:39:08'
+SELECT AVG("A11") 
+FROM "district" 
+WHERE "A11" > 4000 
+AND "district_id" IN (
+    SELECT DISTINCT "district_id" 
+    FROM "account" 
+    WHERE "date" >= '1997-01-01.0'
+)
 
 """
 # ----------------------------------------------------------------------

@@ -24,6 +24,66 @@ def _q(ident: str) -> str:
     return '"' + ident.replace('"', '""') + '"'
 
 
+def _bt(ident: str) -> str:
+    """Backtick-quote an identifier for the (non-executable) sample hints."""
+    return "`" + ident.replace("`", "``") + "`"
+
+
+# Sampling knobs. Kept small on purpose: the samples live in the prefix-cached
+# part of the prompt, so they are prefilled once per db_id and reused.
+SAMPLE_ROWS = 10  # rows scanned per table (no ORDER BY -> cheap + deterministic)
+SAMPLES_PER_COL = 2  # unique non-NULL values shown per column
+SAMPLE_MAX_LEN = 60  # truncate long text/blob-ish values to keep the prefix lean
+
+
+def _format_value(v: object) -> str:
+    """Render one cell as a SQL-ish literal: numbers raw, strings quoted+escaped."""
+    if isinstance(v, bool):  # sqlite has no bool, but be safe
+        return str(int(v))
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, bytes):
+        return "<blob>"
+    s = str(v).replace("\n", " ").replace("\r", " ").strip()
+    if len(s) > SAMPLE_MAX_LEN:
+        s = s[:SAMPLE_MAX_LEN] + "..."
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _data_samples(conn: sqlite3.Connection, table: str) -> str:
+    """Per-column value samples for one table, or "" if empty/unavailable.
+
+    Scans up to SAMPLE_ROWS rows (unordered), then for each column shows up to
+    SAMPLES_PER_COL unique non-NULL values; if NULL occurs in the scanned rows,
+    a trailing NULL is appended.
+    """
+    try:
+        cur = conn.execute(f"SELECT * FROM {_q(table)} LIMIT {SAMPLE_ROWS}")
+        rows = cur.fetchall()
+        names = [d[0] for d in cur.description]
+    except Exception:  # noqa: BLE001 - a bad table shouldn't break the schema
+        return ""
+    if not rows:
+        return ""
+
+    lines = [f"\nData samples for {_bt(table)}:"]
+    for idx, name in enumerate(names):
+        seen_null = False
+        uniques: dict[str, None] = {}
+        for row in rows:
+            val = row[idx]
+            if val is None:
+                seen_null = True
+            elif len(uniques) < SAMPLES_PER_COL:
+                uniques.setdefault(_format_value(val), None)
+        samples = list(uniques.keys())
+        if seen_null:
+            samples.append("NULL")
+        if samples:
+            lines.append(f"- {_bt(name)}: {', '.join(samples)}")
+    return "\n".join(lines)
+
+
 @lru_cache(maxsize=32)
 def render_schema(db_id: str) -> str:
     path = db_path(db_id)
@@ -57,6 +117,9 @@ def render_schema(db_id: str) -> str:
                 )
             parts.append(",\n".join(col_lines))
             parts.append(");")
+            samples = _data_samples(conn, t)
+            if samples:
+                parts.append(samples)
     return "\n".join(parts)
 
 
