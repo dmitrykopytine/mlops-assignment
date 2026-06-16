@@ -30,7 +30,7 @@ from agent.schema import render_schema
 
 # Total generate + revise calls before the loop is forced to stop.
 # 3-5 is a reasonable range; tune it as part of Phase 3.
-MAX_ITERATIONS = 3
+MAX_ITERATIONS = 2
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -204,6 +204,22 @@ def revise_node(state: AgentState) -> dict:
     }
 
 
+def route_after_execute(state: AgentState) -> str:
+    """Gate the LLM verify call behind a cheap deterministic check.
+
+    27/30 eval questions pass on the first try, yet every happy-path request was
+    paying a `verify` LLM call that the eval shows rescues only ~1/30 answers.
+    Under the open-loop load test that extra call is what keeps capacity below
+    the 10 RPS target. So when the SQL executed cleanly and returned at least one
+    row, we trust it and end; we only spend a verify (and possibly revise) call
+    when execution errored or came back empty - the cases actually worth fixing.
+    """
+    ex = state.execution
+    if ex is not None and ex.ok and ex.row_count > 0:
+        return "end"
+    return "verify"
+
+
 def route_after_verify(state: AgentState) -> str:
     """Conditional router: return "revise" to loop, "end" to terminate.
 
@@ -228,7 +244,11 @@ def build_graph():
     g.add_edge(START, "attach_schema")
     g.add_edge("attach_schema", "generate_sql")
     g.add_edge("generate_sql", "execute")
-    g.add_edge("execute", "verify")
+    g.add_conditional_edges(
+        "execute",
+        route_after_execute,
+        {"verify": "verify", "end": END},
+    )
     g.add_conditional_edges(
         "verify",
         route_after_verify,

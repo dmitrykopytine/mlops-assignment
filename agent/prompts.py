@@ -33,9 +33,9 @@ Rules:
 - Every request ends with a STEP section. Produce exactly the OUTPUT it asks for and nothing else: no markdown fences, no comments, no prose.
 
 When not sure about the data format, prepare for any format:
+- Prefer LOWER(...) LIKE '%...%' over strict '=' for string comparisons.
 - Gender can be 'female', 'f', 'F', etc.
 - Filtering by date "Date" = '2010-07-19 19:39:08' may not work because the database expects second fraction part '.0' in the end: "Date" = '2010-07-19 19:39:08.0'.
-- Prefer LIKE '%...%' over '=' for string comparisons.
 
 Schema:
 {schema}"""
