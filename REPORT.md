@@ -194,3 +194,120 @@ Wrote results/eval_after_2iter.json
 
 grafana_after_2iter.png
 
+---
+
+WHY: FP8 (as a decode-speed lever, since memory isn't your constraint) is a sensible next move. 
+
+CHANGE:
+dm9@computeinstance-e00rg2d06zca2cc5s5:~/mlops-assignment$ QUANT=fp8 ./scripts/start_vllm.sh
+INFO 06-16 00:47:38 [__init__.py:216] Automatically detected platform cuda.
+(APIServer pid=312526) INFO 06-16 00:47:39 [api_server.py:1896] vLLM API server version 0.10.2
+(APIServer pid=312526) INFO 06-16 00:47:39 [utils.py:328] non-default args: {'host': '0.0.0.0', 'model': 'Qwen/Qwen3-30B-A3B-Instruct-2507', 'max_model_len': 4096, 'quantization': 'fp8', 'enable_prefix_caching': True, 'max_num_seqs': 64, 'enable_chunked_prefill': True}
+
+Lowered quality:
+
+Wrote results/eval_after_fp8.json
+{
+  "n": 30,
+  "overall_correct": 9,
+  "overall_pass_rate": 0.3,
+  "pass_rate_by_iteration": {
+    "iter_1": 0.2333,
+    "iter_2": 0.3
+  },
+  "correct_by_iteration": {
+    "iter_1": 7,
+    "iter_2": 9
+  },
+  "iterations_histogram": {
+    "1": 26,
+    "2": 4
+  },
+  "gold_exec_failures": 0,
+  "agent_exec_failures": 0
+}
+
+dm9@computeinstance-e00rg2d06zca2cc5s5:~/mlops-assignment$ uv run python load_test/driver.py --rps 10 --duration 300
+{
+  "requested_rps": 10.0,
+  "duration_seconds": 300,
+  "wall_clock_seconds": 301.63027057699946,
+  "total_requests": 3000,
+  "achieved_rps": 9.945951360455936,
+  "ok": 2999,
+  "timeouts": 1,
+  "http_errors": 0,
+  "client_errors": 0,
+  "latency_p50": 0.9106319940001413,
+  "latency_p95": 4.458442585000739,
+  "latency_p99": 7.242408016001718,
+  "latency_max": 15.465798738001467
+}
+Wrote /home/dm9/mlops-assignment/results/load_test.json
+
+grafana_after_fp8.png
+
+---
+
+RERUN
+
+Wrote results/eval_after_fp8_rerun.json
+{
+  "n": 30,
+  "overall_correct": 10,
+  "overall_pass_rate": 0.3333,
+  "pass_rate_by_iteration": {
+    "iter_1": 0.2667,
+    "iter_2": 0.3333
+  },
+  "correct_by_iteration": {
+    "iter_1": 8,
+    "iter_2": 10
+  },
+  "iterations_histogram": {
+    "1": 26,
+    "2": 4
+  },
+  "gold_exec_failures": 0,
+  "agent_exec_failures": 0
+}
+
+dm9@computeinstance-e00rg2d06zca2cc5s5:~/mlops-assignment$ uv run python load_test/driver.py --rps 10.1 --duration 300
+{
+  "requested_rps": 10.1,
+  "duration_seconds": 300,
+  "wall_clock_seconds": 302.1357397679967,
+  "total_requests": 3030,
+  "achieved_rps": 10.028605031389763,
+  "ok": 3028,
+  "timeouts": 2,
+  "http_errors": 0,
+  "client_errors": 0,
+  "latency_p50": 0.9077059369992639,
+  "latency_p95": 4.306971434001753,
+  "latency_p99": 6.730653405000339,
+  "latency_max": 14.761524970999744
+}
+Wrote /home/dm9/mlops-assignment/results/load_test.json
+
+---
+
+ABOUT evals
+
+"List all patients who were followed up at the outpatient clinic who underwent a laboratory test in October 1991 and had a total blood bilirubin level within the normal range."
+
+"thrombosis_prediction"
+
+"SELECT DISTINCT p."ID", p."SEX", p."Birthday", p."Description", p."First Date", p."Admission", p."Diagnosis"
+FROM "Patient" p
+JOIN "Laboratory" l ON p."ID" = l."ID"
+WHERE p."Admission" = 'outpatient clinic'
+AND l."Date" >= '1991-10-01' AND l."Date" < '1991-11-01'
+AND l."T-BIL" >= 0.2 AND l."T-BIL" <= 1.2"
+
+"SELECT DISTINCT p."ID", p."SEX", p."Birthday", p."Description", p."First Date", p."Admission", p."Diagnosis"
+FROM "Patient" p
+JOIN "Laboratory" l ON p."ID" = l."ID"
+WHERE LOWER(p."Admission") LIKE '%outpatient clinic%'
+AND l."Date" >= '1991-10-01' AND l."Date" < '1991-11-01'
+AND l."T-BIL" >= 0.2 AND l."T-BIL" <= 1.2"

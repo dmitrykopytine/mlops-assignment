@@ -15,6 +15,19 @@ fi
 
 MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
 
+# Runtime FP8 weight quantization toggle. On-the-fly quantizes the BF16
+# checkpoint at load time (no separate download); the served model name stays
+# unchanged, so the agent's VLLM_MODEL needs no edit. Halves weight bandwidth
+# per decode step -> lower ITL on the MoE.
+#   QUANT=fp8 ./scripts/start_vllm.sh   # enable
+#   ./scripts/start_vllm.sh             # default: BF16 (no quantization)
+QUANT="${QUANT:-}"
+
+quant_args=()
+if [[ -n "$QUANT" ]]; then
+    quant_args+=(--quantization "$QUANT")
+fi
+
 exec uv run python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --host 0.0.0.0 \
@@ -23,4 +36,5 @@ exec uv run python -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization 0.90 \
     --max-num-seqs 64 \
     --enable-chunked-prefill \
-    --enable-prefix-caching
+    --enable-prefix-caching \
+    ${quant_args[@]+"${quant_args[@]}"}
