@@ -20,20 +20,16 @@ MAX_PREVIEW_ROWS = 30
 
 # ---- Paste the failure dump between the triple quotes -----------------
 DUMP = """
-Database: financial
+Database: codebase_community
 
 Expected (gold) SQL:
-SELECT AVG(T1.A15) FROM district AS T1 INNER JOIN account AS T2 ON T1.district_id = T2.district_id WHERE STRFTIME('%Y', T2.date) >= '1997' AND T1.A15 > 4000
+SELECT T1.Id, T1.Reputation, T2.* FROM users AS T1 INNER JOIN badges AS T2 ON T1.Id = T2.UserId WHERE T2.Date = '2010-07-19 19:39:08.0' ORDER BY T1.Id
 
 Actual SQL:
-SELECT AVG("A11") 
-FROM "district" 
-WHERE "A11" > 4000 
-AND "district_id" IN (
-    SELECT DISTINCT "district_id" 
-    FROM "account" 
-    WHERE "date" >= '1997-01-01.0'
-)
+SELECT DISTINCT u."Reputation"
+FROM "badges" b
+JOIN "users" u ON u."Id" = b."UserId"
+WHERE b."Date" LIKE '2010-07-19 19:39:08%'
 
 """
 # ----------------------------------------------------------------------
