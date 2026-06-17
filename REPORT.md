@@ -7,7 +7,7 @@ Flags used to launch vLLM (`scripts/start_vllm.sh`):
 - `--max-num-seqs 64`: Set generously to hit 10+ RPS, but running requests plateaued at ~40 (then 30 and even 15 after the optimisations).
 - `--enable-chunked-prefill`: Long prefills won't block decodes -> better p95 under load.
 - `--enable-prefix-caching`: Our requests share prefixes (system prompt + schema), so the system clearly benefits from it.
-- `--quantization fp8`: Quantisation is added after Phase 6 (optimisation), see details below.
+- [Added later as part of optimisation] `--quantization fp8`: See details below.
 
 # 2. Baseline eval results (Phase 5): overall pass rate, per-iteration pass rate, brief commentary
 
@@ -17,7 +17,7 @@ Baseline eval: `results/eval_baseline.json`
 - Per-iteration pass rate: 10 (iter 1), 10 (iter 2), 11 (iter 3).
 - Attempted iterations: 1 (27 requests), 3 (3 requests).
 
-The improvement on the later iterations comes from uncertainty in the data format. The LLM tries an explicit fixed-string condition like `department = 'Art and Design'`. When it fails (because such a string does not exist in exactly this form), it retries with `LOWER()` and `LIKE '%...%'` and succeeds. More on this in answer #4 about agent value below.
+The improvement in the later iterations comes from uncertainty in the data format. The LLM tries an explicit fixed-string condition like `department = 'Art and Design'`. When it fails (because such a string does not exist in exactly this form), it retries with `LOWER()` and `LIKE '%...%'` and succeeds. More on this in answer #4 about agent value below.
 
 Side note on quality improvement attempts:
 
@@ -97,7 +97,7 @@ Quantisation will help to speed up the system (mostly decode, since memory isn't
 Since MoE decode is memory-bandwidth-bound, halving the weight bytes speeds up decode.
 
 #### Changed
-I tried fp8 quantization to replace the original BF16.
+I tried fp8 quantisation to replace the original BF16.
 
 #### Result
 - Less time spent in the 'decode' stage (according to Grafana).
