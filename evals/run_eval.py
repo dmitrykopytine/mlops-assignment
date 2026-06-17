@@ -28,7 +28,7 @@ AGENT_URL_DEFAULT = "http://localhost:8001/answer"
 
 # When DEBUG is on we (a) optionally restrict the run to a handful of evals and
 # (b) print a detailed dump for every failed eval. Turn off for a clean run.
-DEBUG = True
+DEBUG = False
 
 # 1-indexed line numbers in the eval set to run (matches the file's line
 # numbers). Empty -> run the whole eval set as usual. Only honored when DEBUG.
