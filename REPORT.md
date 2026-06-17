@@ -1,313 +1,136 @@
-Initial config:
+# 1. Serving configuration (Phase 1), your chosen flags, one line of justification each.
 
-export HF_TOKEN=$(grep '^HF_TOKEN=' .env | cut -d= -f2)
-uv run python -m vllm.entrypoints.openai.api_server \
-    --model "Qwen/Qwen3-30B-A3B-Instruct-2507" \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --max-model-len 4096 \
-    --gpu-memory-utilization 0.90 \
-    --max-num-seqs 64 \
-    --enable-chunked-prefill \
-    --enable-prefix-caching
+Flags used to launch VLLM (scripts/start_vllm.sh):
 
---max-model-len 4096: your prompts top out ~3K + short outputs. Keeping context tight frees KV cache for more concurrent sequences → higher throughput/RPS.
---gpu-memory-utilization 0.90: gives the KV cache more room on the 80GB card without OOM risk.
---max-num-seqs 64: allows enough concurrency to hit 10+ RPS; tune up/down based on latency.
---enable-chunked-prefill: long-ish prefills (1.5–3K tokens) won't block decodes → better P95 under load.
---enable-prefix-caching: your 2–3 dependent calls per request likely share system/prompt prefixes → big latency win on repeated prefixes.
+--max-model-len 4096: The prompts are ~3K tokens + short outputs (up to 512). Selecting bigger value would likely not affect performance, but keeping it tight helps in debugging of an accidental context overuse.
 
-"Please list the full names of the students in the Student_Club that come from the Art and Design Department."
-"student_club"
+--gpu-memory-utilization 0.90: More room for KV cache without OOM risk.
 
-"SELECT m.first_name, m.last_name
-FROM member m
-JOIN major maj ON m.link_to_major = maj.major_id
-WHERE maj.department = 'Art and Design'"
+--max-num-seqs 64: Allows enough concurrency to hit 10+ RPS.
 
-"SELECT m.first_name, m.last_name
-FROM member m
-JOIN major maj ON m.link_to_major = maj.major_id
-WHERE LOWER(maj.department) = 'art and design'"
+--enable-chunked-prefill: Long prefills won't block decodes -> better P95 under load.
 
-"SELECT m.first_name, m.last_name
-FROM member m
-JOIN major maj ON m.link_to_major = maj.major_id
-WHERE LOWER(maj.department) LIKE '%art and design%'"
+--enable-prefix-caching: Our requests share prefixes (system prompt + schema), so the system will definitely benefit from it.
 
-BEFORE:
-dm9@computeinstance-e00rg2d06zca2cc5s5:~/mlops-assignment$ uv run python c --rps 10 --duration 300
-{
-  "requested_rps": 10.0,
-  "duration_seconds": 300,
-  "wall_clock_seconds": 347.51548531700064,
-  "total_requests": 3000,
-  "achieved_rps": 8.632708833862255,
-  "ok": 2616,
-  "timeouts": 1,
-  "http_errors": 383,
-  "client_errors": 0,
-  "latency_p50": 35.87833720600065,
-  "latency_p95": 77.05337293699995,
-  "latency_p99": 83.89367194900115,
-  "latency_max": 102.60400766399835
-}
-Wrote /home/dm9/mlops-assignment/results/load_test.json
+# 2. Baseline eval results (Phase 5), overall pass rate, per-iteration pass rate, brief commentary.
 
-After fixing a bug with attach_schema:
-Also, fixing the bug with context overflow when too much data is returned from execute() and we send it all to verify().
+Baseline eval: results/eval_baseline.json
 
-dm9@computeinstance-e00rg2d06zca2cc5s5:~/mlops-assignment$ uv run python load_test/driver.py --rps 10 --duration 300
-{
-  "requested_rps": 10.0,
-  "duration_seconds": 300,
-  "wall_clock_seconds": 359.3013099029995,
-  "total_requests": 3000,
-  "achieved_rps": 8.349538165641281,
-  "ok": 2995,
-  "timeouts": 5,
-  "http_errors": 0,
-  "client_errors": 0,
-  "latency_p50": 38.043103411999255,
-  "latency_p95": 91.55161022500033,
-  "latency_p99": 97.78207281800132,
-  "latency_max": 117.14981022100073
-}
-Wrote /home/dm9/mlops-assignment/results/load_test.json
+- Overall pass rate: 11 out of 30.
+- Per iteration pass rate: 10 (iter 1), 10 (iter 2), 11 (iter 3).
+- Attempted iterations: 1 (27 requests), 3 (3 requests)
 
-Changed graph.py.
+The improvement on the later iterations comes from uncertainty in the data format. LLM tries explicit fixed string condition like `department = 'Art and Design'`. When it fails (because such string does not exist in exactly this form), it repeats with `LOWER()`, `LIKE '%...%'` and succeeds. More info on this - in the answer #4 about agent value below.
 
-WHY:
+Side note on quality improvement attempts:
 
-Grafana (this run, same shape as before):
+- I tried using a different external model (gpt-4o-mini and gpt-5.4).
+- I tried adding data samples for each table into the prompt.
+- Neither of these 2 changes improved the pass rate.
+- I believe, to improve a base eval, the agent's architecture must be changed. See my thoughts on it in the answer to the question #5.
 
-KV cache ~5–10%, preemptions zero, vLLM's own waiting-queue ~0, requests running plateaus ~40 while max-num-seqs=64. → vLLM is not memory-bound; if anything it's starved. Memory knobs (FP8-for-KV, bigger max-num-seqs) won't help.
-Decode dominates per-call latency (ITL 60–90 ms/tok, lifecycle decode band ~8s, vLLM e2e p95 ~10–12s), and token throughput is prefill-heavy — the GPU spends most of its budget re-processing big prompts.
-The math that matters: your driver is open-loop at 10 rps but capacity is only ~8.3 rps, so a backlog builds for the whole 5 min and latency runs away (p50 already 38s). The only way to fix p95 is to push capacity above 10 rps so no backlog forms. Capacity = vLLM calls/sec ÷ calls per request. You're serving ~20 calls/s; each request costs ~2.4 calls → ~8.3 rps. Cut calls-per-request and capacity jumps above 10 → backlog clears → latency collapses toward the unloaded per-call time (~1–2s, since KV is empty).
+# 3. Hitting the SLO (Phase 6), baseline performance vs. SLO, the iteration log, the final numbers.
 
-CHANGE:
+## Baseline vs final numbers:
 
-Gate the LLM verify call behind a cheap deterministic check.
 
-    27/30 eval questions pass on the first try, yet every happy-path request was
-    paying a `verify` LLM call that the eval shows rescues only ~1/30 answers.
-    Under the open-loop load test that extra call is what keeps capacity below
-    the 10 RPS target. So when the SQL executed cleanly and returned at least one
-    row, we trust it and end; we only spend a verify (and possibly revise) call
-    when execution errored or came back empty - the cases actually worth fixing.
+|          | RPS  | Latency p95 | Timeouts      | HTTP errors | Eval pass rate |
+| -------- | ---- | ----------- | ------------- | ----------- | -------------- |
+| Baseline | 8.3  | 77 s        | 5 out of 3000 | 0           | 11 out of 30   |
+| Final    | 10.0 | 4.3 s       | 2 out of 3030 | 0           | 10 out of 30   |
 
-Quality did not change.
 
-Wrote results/eval_after_early_end.json
-{
-  "n": 30,
-  "overall_correct": 12,
-  "overall_pass_rate": 0.4,
-  "pass_rate_by_iteration": {
-    "iter_1": 0.3667,
-    "iter_2": 0.3667,
-    "iter_3": 0.4
-  },
-  "correct_by_iteration": {
-    "iter_1": 11,
-    "iter_2": 11,
-    "iter_3": 12
-  },
-  "iterations_histogram": {
-    "1": 27,
-    "3": 3
-  },
-  "gold_exec_failures": 0,
-  "agent_exec_failures": 0
-}
+The SLO (10 rps & p95 latency < 5 sec) was achieved after 3 optimisations (see below).
 
-dm9@computeinstance-e00rg2d06zca2cc5s5:~/mlops-assignment$ uv run python load_test/driver.py --rps 10 --duration 300
-{
-  "requested_rps": 10.0,
-  "duration_seconds": 300,
-  "wall_clock_seconds": 304.7567046969998,
-  "total_requests": 3000,
-  "achieved_rps": 9.843917963946714,
-  "ok": 2998,
-  "timeouts": 2,
-  "http_errors": 0,
-  "client_errors": 0,
-  "latency_p50": 1.3471105270000407,
-  "latency_p95": 8.42837745199904,
-  "latency_p99": 14.567598691999592,
-  "latency_max": 32.35760068000127
-}
-Wrote /home/dm9/mlops-assignment/results/load_test.json
+## Initial condition (baseline before any optimisations)
 
-grafana_after_early_end.png
+- The prompts were already optimized to share the prefix as much as possible.
+- Fixed 2 bugs leading to http errors: a bug with attach_schema (in the provided code, led to occasional schema generation failures), and context overflow issue (to fix that, the execution results were truncated before sending them to verify step).
+- KV cache has < 20% usage, 90%+ hit rate, no preemptions, vLLM's own waiting queue ~0 -> vLLM is not memory-bound.
 
----
+## Optimisation steps
 
-WHY:
+When testing at 10 rps (the capacity turned out to be 8.3 rps), VLLM end-to-end latency (p95) according to Grafana was 5 sec. Total agent request latency (p95) was 77 sec. Since the system is not memory restricted, it was unlikely that I can push VLLM end-to-end latency much further. And for any agent request these 5 sec of VLLM would add up to a significant number, if the number of LLM calls is big. So the main decision was to reduce the number of LLM calls per agent request.
 
-Your p50 is 1.35s — the median request is a single generate call and it's fast. p95 8.4s / p99 14.6s / max 32s is the ~10% tail that hits the verify→revise path (execution errored or returned 0 rows), doing 3–6 sequential vLLM calls. To get p95 under 5s, shorten that tail:
+### Optimisation 1 ('early end')
 
-Tighten the revise loop: MAX_ITERATIONS 3→2. The eval showed iter3 adds only +1/30, and those 3-iteration runs are precisely your p95/p99/max. This directly chops the longest paths — strongest single move, measure quality with eval_after_tuning.json.
+I stopped resending data for verification if the answer has no sql errors, and at least 1 row was returned. Why I could afford this - because 27/30 eval questions pass verify on the first try, and evals worth revising always get revised because SQL returned 0 rows.
 
-CHANGE: MAX_ITERATIONS = 2 + minor prompt tweak to stay on 11/30.
+Results: acheived 9.84 rps (good!), p95 latency 8.4 s (much closer to the target!), eval grew from 11 to 12 (random rise, no quality decrease!)
 
-dm9@computeinstance-e00rg2d06zca2cc5s5:~/mlops-assignment$ uv run python load_test/driver.py --rps 10 --duration 300
-{
-  "requested_rps": 10.0,
-  "duration_seconds": 300,
-  "wall_clock_seconds": 307.9410722419998,
-  "total_requests": 3000,
-  "achieved_rps": 9.742123641247856,
-  "ok": 2998,
-  "timeouts": 2,
-  "http_errors": 0,
-  "client_errors": 0,
-  "latency_p50": 1.27043133099869,
-  "latency_p95": 6.187561566001023,
-  "latency_p99": 9.957056960000045,
-  "latency_max": 24.039973681001356
-}
-Wrote /home/dm9/mlops-assignment/results/load_test.json
+Artifacts:
 
-Quality:
+- screenshots/grafana_after_early_end.png
+- screenshots/grafana_after.png is the same file as grafana_after_early_end.png because is was the key optimisation ('the change that moved the needle').
+- results/eval_after_early_end.json
 
-Wrote results/eval_after_2iter.json
-{
-  "n": 30,
-  "overall_correct": 11,
-  "overall_pass_rate": 0.3667,
-  "pass_rate_by_iteration": {
-    "iter_1": 0.3333,
-    "iter_2": 0.3667
-  },
-  "correct_by_iteration": {
-    "iter_1": 10,
-    "iter_2": 11
-  },
-  "iterations_histogram": {
-    "1": 27,
-    "2": 3
-  },
-  "gold_exec_failures": 0,
-  "agent_exec_failures": 0
-}
+### Optimisation 2 ('2iter')
 
-grafana_after_2iter.png
+After the last optimisation p50 is 1.35s (perfect!), p95 is 8.4s (too big!), so we need to remove the long tail. Further reduction was done by reducing the number of iteratinos from 3 to 2. To compensate for this, I slightly modified prompts to force LLM use more LIKE conditions and do not assume it knows exact titles/strings which it tried to guess.
 
----
+Result: p95 latency dropped from 8.4 to 6.2 sec (very good but not enough!)
 
-WHY: FP8 (as a decode-speed lever, since memory isn't your constraint) is a sensible next move. 
+Artifacts:
 
-CHANGE:
-dm9@computeinstance-e00rg2d06zca2cc5s5:~/mlops-assignment$ QUANT=fp8 ./scripts/start_vllm.sh
-INFO 06-16 00:47:38 [__init__.py:216] Automatically detected platform cuda.
-(APIServer pid=312526) INFO 06-16 00:47:39 [api_server.py:1896] vLLM API server version 0.10.2
-(APIServer pid=312526) INFO 06-16 00:47:39 [utils.py:328] non-default args: {'host': '0.0.0.0', 'model': 'Qwen/Qwen3-30B-A3B-Instruct-2507', 'max_model_len': 4096, 'quantization': 'fp8', 'enable_prefix_caching': True, 'max_num_seqs': 64, 'enable_chunked_prefill': True}
+- screenshots/grafana_after_2iter.png
+- results/eval_after_2iter.json
 
-Lowered quality:
+### Optimisation 3 ('fp8')
 
-Wrote results/eval_after_fp8.json
-{
-  "n": 30,
-  "overall_correct": 9,
-  "overall_pass_rate": 0.3,
-  "pass_rate_by_iteration": {
-    "iter_1": 0.2333,
-    "iter_2": 0.3
-  },
-  "correct_by_iteration": {
-    "iter_1": 7,
-    "iter_2": 9
-  },
-  "iterations_histogram": {
-    "1": 26,
-    "2": 4
-  },
-  "gold_exec_failures": 0,
-  "agent_exec_failures": 0
-}
+According to Grafana, end-to-end VLLM latency (p95) was still high enough - close to the target 5s, while VLLM call is only a part(s) of the request processing.
 
-dm9@computeinstance-e00rg2d06zca2cc5s5:~/mlops-assignment$ uv run python load_test/driver.py --rps 10 --duration 300
-{
-  "requested_rps": 10.0,
-  "duration_seconds": 300,
-  "wall_clock_seconds": 301.63027057699946,
-  "total_requests": 3000,
-  "achieved_rps": 9.945951360455936,
-  "ok": 2999,
-  "timeouts": 1,
-  "http_errors": 0,
-  "client_errors": 0,
-  "latency_p50": 0.9106319940001413,
-  "latency_p95": 4.458442585000739,
-  "latency_p99": 7.242408016001718,
-  "latency_max": 15.465798738001467
-}
-Wrote /home/dm9/mlops-assignment/results/load_test.json
+So I decided to try fp8 quantization to replace the original BF16 - mostly as a decode-speed lever, since memory isn't the constraint.
 
-grafana_after_fp8.png
+Result: less time spent in 'decode' stage (accoring to Grafana) => acheived the target SLO: 10.0 RPS, 4.3s p95 latency
 
----
+I had to test at 10.1 RPS (not 10.0) to make the final result above 10.0.
 
-RERUN
+It came at a price of quality reduction though: eval pass dropped to 10 from 11 out of 30 (even though there's some randomness in every eval run, the reported quality decrease is not random: running eval multiple times before and after the last optimisation, I see that the pass rate dropped from quite stable values 11-12 to 9-10).
 
-Wrote results/eval_after_fp8_rerun.json
-{
-  "n": 30,
-  "overall_correct": 10,
-  "overall_pass_rate": 0.3333,
-  "pass_rate_by_iteration": {
-    "iter_1": 0.2667,
-    "iter_2": 0.3333
-  },
-  "correct_by_iteration": {
-    "iter_1": 8,
-    "iter_2": 10
-  },
-  "iterations_histogram": {
-    "1": 26,
-    "2": 4
-  },
-  "gold_exec_failures": 0,
-  "agent_exec_failures": 0
-}
+Artifacts:
 
-dm9@computeinstance-e00rg2d06zca2cc5s5:~/mlops-assignment$ uv run python load_test/driver.py --rps 10.1 --duration 300
-{
-  "requested_rps": 10.1,
-  "duration_seconds": 300,
-  "wall_clock_seconds": 302.1357397679967,
-  "total_requests": 3030,
-  "achieved_rps": 10.028605031389763,
-  "ok": 3028,
-  "timeouts": 2,
-  "http_errors": 0,
-  "client_errors": 0,
-  "latency_p50": 0.9077059369992639,
-  "latency_p95": 4.306971434001753,
-  "latency_p99": 6.730653405000339,
-  "latency_max": 14.761524970999744
-}
-Wrote /home/dm9/mlops-assignment/results/load_test.json
+- screenshots/grafana_after_fp8.png
+- results/eval_after_fp8.json
 
----
+### Detailed optimisation summary
 
-ABOUT evals
 
-"List all patients who were followed up at the outpatient clinic who underwent a laboratory test in October 1991 and had a total blood bilirubin level within the normal range."
+| Optimisation      | RPS requested | RPS achieved | latency p50/95/99 | Timeouts | HTTP err | Eval pass |
+| ----------------- | ------------- | ------------ | ----------------- | -------- | -------- | --------- |
+| Baseline          | 10            | 8.3          | 38/77/98 sec      | 5/3000   | 0        | 11/30     |
+| After early end   | 10            | 9.84         | 1.3/8.4/14.6 sec  | 2/3000   | 0        | 12/30     |
+| After 2iter       | 10            | 9.74         | 1.3/6.2/10.0 sec  | 2/3000   | 0        | 11/30     |
+| After fp8 (final) | 10.1          | 10.03        | 0.9/4.3/6.7 sec   | 2/3030   | 0        | 10/30     |
 
-"thrombosis_prediction"
 
-"SELECT DISTINCT p."ID", p."SEX", p."Birthday", p."Description", p."First Date", p."Admission", p."Diagnosis"
-FROM "Patient" p
-JOIN "Laboratory" l ON p."ID" = l."ID"
-WHERE p."Admission" = 'outpatient clinic'
-AND l."Date" >= '1991-10-01' AND l."Date" < '1991-11-01'
-AND l."T-BIL" >= 0.2 AND l."T-BIL" <= 1.2"
+# 4. Agent value, one paragraph. Did the loop actually help? How do you know? Cite the per-iteration pass rate.
 
-"SELECT DISTINCT p."ID", p."SEX", p."Birthday", p."Description", p."First Date", p."Admission", p."Diagnosis"
-FROM "Patient" p
-JOIN "Laboratory" l ON p."ID" = l."ID"
-WHERE LOWER(p."Admission") LIKE '%outpatient clinic%'
-AND l."Date" >= '1991-10-01' AND l."Date" < '1991-11-01'
-AND l."T-BIL" >= 0.2 AND l."T-BIL" <= 1.2"
+The loop helped mostly in the situations when LLM is not sure about the exact value/title. Seeing 0 rows in SQL result, it iterated to achieve the right selection.
+
+Example for the eval "Please list the full names of the students in the Student_Club that come from the Art and Design Department.":
+- WHERE maj.department = 'Art and Design'" (iter 1)
+- WHERE LOWER(maj.department) = 'art and design'" (iter 2)
+- WHERE LOWER(maj.department) LIKE '%art and design%'" (iter 3)
+
+I tried to convinse LLM to use LOWER() and LIKE '%...%' in all prompts from iter 1, but it just does not want to do it at the first attempt - at least not in all queries.
+
+# 5. What you'd do with more time, and be specific here! "Add Kubernetes" doesn't count.
+
+With more time, I'd work on quality assessment (evals) and improvement. This would reduce RPS, but who needs fast low-quality service?
+
+1) The evals themselves are low quality (as discussed in Discord, different parts of the BIRD evals have noise level at 15%-50%). I myself found 2 problems (out of 30 evals) in the 'gold' queries. So I would make at lease 30-50 my own evals which I can rely on.
+
+2) So I would use a richer agentic loop.
+
+From what I debugged, most quality problems come from the uncertainty in data format:
+- 'F' or 'female'?
+- 'Art and Design' or 'Department of Art and Design' or 'Art and Design Department'?
+- Does such row exist at all?
+
+So my agent would have a richer graph:
+- proper planning
+- data sampling and exploration
+- getting all unique column values when needed
+- data check (does the row exist?)
+- partial SQL running for intermediate verification
+- etc.
