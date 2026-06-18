@@ -4,7 +4,7 @@ Flags used to launch vLLM (`scripts/start_vllm.sh`):
 
 - `--max-model-len 4096`: The prompts are ~3K tokens plus short outputs (up to 512). A bigger value would likely not affect performance, but keeping it tight helps when debugging accidental context overuse.
 - `--gpu-memory-utilization 0.90`: More room for the KV cache without OOM risk (model weights already consume ~61 GB of the 80 GB GPU).
-- `--max-num-seqs 64`: Set generously to hit 10+ RPS, but running requests plateaued at ~40 (then 30 and even 15 after the optimisations).
+- `--max-num-seqs 64`: Set generously to hit 10+ RPS, but in fact I never reached 64 - running requests plateaued at ~40 (then 30 and even 15 after the optimisations).
 - `--enable-chunked-prefill`: Long prefills won't block decodes -> better p95 under load.
 - `--enable-prefix-caching`: Our requests share prefixes (system prompt + schema), so the system clearly benefits from it.
 - [Added later as part of optimisation] `--quantization fp8`: See details below.
@@ -41,7 +41,7 @@ The SLO (10 RPS and p95 latency < 5 s) was achieved after 3 optimisations (see b
 
 - The prompts were already optimised to share the prefix as much as possible.
 - Fixed 2 bugs leading to HTTP errors: a bug with `attach_schema` (in the provided code, which led to occasional schema generation failures), and a context overflow issue (to fix it, the execution results were truncated before being sent to the verify step).
-- The KV cache has < 20% usage, a 90%+ hit rate, no preemptions, and vLLM's own waiting queue is ~0 -> vLLM is not memory-bound.
+- The KV cache has < 20% usage, a 90%+ hit rate, no preemptions, so the system is not restricted by HBM memory size.
 
 Artifacts:
 
@@ -56,7 +56,7 @@ Artifacts:
 When testing at 10 RPS (the capacity turned out to be 8.3 RPS), vLLM end-to-end latency (p95) according to Grafana was about 5 s. Total agent request latency (p95) was 92 s.
 
 #### Hypothesized
-Since the system is not memory-bound, it was unlikely that I could push vLLM end-to-end latency much further (quantisation helps, but not dramatically in a non-memory-bound system). And for any agent request, these 5 s of vLLM would add up to a significant number if the number of LLM calls is large. So the main decision was to reduce the number of LLM calls per agent request.
+Since the system is not constrained by memory size, it was unlikely that I could push vLLM end-to-end latency much further (quantisation helps, but not dramatically). And for any agent request, these 5 s of vLLM would add up to a significant number if the number of LLM calls is large. So the main decision was to reduce the number of LLM calls per agent request.
 
 #### Changed
 I stopped resending data for verification if the answer had no SQL errors and at least 1 row was returned. I could afford this because 27/30 eval questions pass verify on the first try, and evals worth revising always get revised because the SQL returned 0 rows.
@@ -82,6 +82,7 @@ I reduced the number of iterations from 3 to 2. To compensate, I slightly modifi
 
 #### Result
 p95 latency dropped from 8.4 to 6.2 s (very good, but not enough!).
+The quality was not affected: eval pass rate stays at 11/30 as in the beginning of the optimisations.
 
 #### Artifacts
 - `screenshots/grafana_after_2iter.png`
@@ -93,8 +94,8 @@ p95 latency dropped from 8.4 to 6.2 s (very good, but not enough!).
 According to Grafana, end-to-end vLLM latency (p95) was still high enough - close to the target of 5 s - while the vLLM call is only a part of the request processing.
 
 #### Hypothesized
-Quantisation will help to speed up the system (mostly decode, since memory isn't the constraint).
-Since MoE decode is memory-bandwidth-bound, halving the weight bytes speeds up decode.
+Quantisation will help speed up the system (mostly decode, since memory size isn't the constraint).
+Why decode speeds up: MoE decode is memory-bandwidth-bound, so halving the weight bytes helps move less data from HBM.
 
 #### Changed
 I tried fp8 quantisation to replace the original BF16.
